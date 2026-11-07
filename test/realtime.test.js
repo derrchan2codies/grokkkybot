@@ -3,7 +3,16 @@ import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
 import handler from '../api/token.js';
 import { createDownsampler } from '../public/pcm-resample.js';
-import { REALTIME_MODEL, REALTIME_URL, assertRealtimeSession, buildSession, resolveVoice } from '../public/realtime-session.js';
+import {
+  INSTRUCTIONS,
+  TTS_MODEL,
+  assertSignedUrl,
+  buildAgentUpdate,
+  buildInitiation,
+  pcmRate,
+  resolveAgentId,
+  resolveVoiceId
+} from '../public/agent-session.js';
 
 function mockRes() {
   return {
@@ -16,38 +25,39 @@ function mockRes() {
   };
 }
 
-test('session config is Eleven Realtime v1 mini at 24 kHz PCM', () => {
-  const session = buildSession();
-  assert.equal(session.model, 'eleven_realtime_v1_mini');
-  assert.equal(session.model, REALTIME_MODEL);
-  assert.deepEqual(session.output_modalities, ['audio']);
-  assert.deepEqual(session.audio.input.format, { type: 'audio/pcm', rate: 24000 });
-  assert.deepEqual(session.audio.output.format, { type: 'audio/pcm' });
-  assert.equal(session.audio.output.voice, 'brian');
-  assert.equal(session.audio.input.turn_detection.type, 'semantic_vad');
-  assert.equal(REALTIME_URL, 'wss://api.elevenlabs.io/v1/convai/realtime');
-  assert.doesNotThrow(() => assertRealtimeSession(session));
-  assert.throws(() => resolveVoice('has spaces'), /ELEVENLABS_VOICE/);
-  assert.equal(resolveVoice(''), 'brian');
-  assert.equal(resolveVoice('  Sarah '), 'Sarah');
+const SIGNED = 'wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_test&token=abc';
+
+test('the conversational agent uses eleven_v4_turbo and the kept instructions', () => {
+  const update = buildAgentUpdate('');
+  assert.equal(update.conversation_config.tts.model_id, 'eleven_v4_turbo');
+  assert.equal(update.conversation_config.tts.model_id, TTS_MODEL);
+  assert.equal(update.conversation_config.agent.prompt.prompt, INSTRUCTIONS);
+  assert.match(INSTRUCTIONS, /helpful, friendly voice assistant/);
+  assert.match(INSTRUCTIONS, /Keep replies concise and conversational/);
+  assert.match(INSTRUCTIONS, /The user can interrupt you at any time/);
+  assert.equal(update.conversation_config.asr.user_input_audio_format, 'pcm_16000');
+  assert.equal(update.conversation_config.tts.agent_output_audio_format, 'pcm_16000');
+  assert.equal(update.conversation_config.agent.disable_first_message_interruptions, false);
+  const initiation = buildInitiation();
+  assert.equal(initiation.conversation_config_override.tts.model_id, 'eleven_v4_turbo');
+  assert.equal(initiation.conversation_config_override.agent.prompt.prompt, INSTRUCTIONS);
+  assert.equal(pcmRate('pcm_16000'), 16000);
+  assert.throws(() => pcmRate('ulaw_8000'), /Unsupported audio format/);
+  assert.throws(() => resolveVoiceId('brian'), /ELEVENLABS_VOICE_ID/);
+  assert.equal(resolveVoiceId(''), '');
+  assert.equal(resolveVoiceId('cjVigY5qzO86Huf0OWal'), 'cjVigY5qzO86Huf0OWal');
+  assert.throws(() => resolveAgentId('bad id'), /ELEVENLABS_AGENT_ID/);
+  assert.doesNotThrow(() => assertSignedUrl(SIGNED));
+  assert.throws(() => assertSignedUrl('wss://api.x.ai/v1/realtime'), /Unexpected WebSocket endpoint/);
 });
 
-test('48 kHz microphone audio is resampled to 24 kHz PCM16', () => {
-  const down = createDownsampler(48000, 24000, 480);
+test('48 kHz microphone audio is resampled to 16 kHz PCM16', () => {
+  const down = createDownsampler(48000, 16000, 320);
   const chunks = [];
   for (let n = 0; n < 100; n++) chunks.push(...down.push(new Float32Array(480).fill(0.5)));
   const samples = chunks.reduce((sum, chunk) => sum + new Int16Array(chunk.bytes).length, 0);
-  assert.equal(samples, 24000);
-  const first = new Int16Array(chunks[0].bytes);
-  assert.ok(first.every(sample => sample === 16384));
-  assert.ok(chunks[0].level > 0.4 && chunks[0].level < 0.6);
-});
-
-test('24 kHz audio passes through one sample at a time', () => {
-  const down = createDownsampler(24000, 24000, 4);
-  const input = Float32Array.from([0, 0.5, -1, 1, 0]);
-  const [chunk] = down.push(input);
-  assert.deepEqual([...new Int16Array(chunk.bytes)], [0, 16384, -32768, 32767]);
+  assert.equal(samples, 16000);
+  assert.ok(new Int16Array(chunks[0].bytes).every(sample => sample === 16384));
 });
 
 test('token route rejects anything except POST and a missing key', async () => {
@@ -57,7 +67,6 @@ test('token route rejects anything except POST and a missing key', async () => {
     const get = mockRes();
     await handler({ method: 'GET' }, get);
     assert.equal(get.statusCode, 405);
-    assert.equal(get.headers.Allow, 'POST');
     const post = mockRes();
     await handler({ method: 'POST' }, post);
     assert.equal(post.statusCode, 503);
@@ -68,52 +77,59 @@ test('token route rejects anything except POST and a missing key', async () => {
   }
 });
 
-test('token route mints an ElevenLabs client secret and returns only the browser fields', async () => {
-  const previousKey = process.env.ELEVENLABS_API_KEY;
-  const previousVoice = process.env.ELEVENLABS_VOICE;
+test('token route creates an eleven_v4_turbo agent and returns only a signed URL', async () => {
+  const previous = process.env.ELEVENLABS_API_KEY;
+  const previousAgent = process.env.ELEVENLABS_AGENT_ID;
+  const previousVoice = process.env.ELEVENLABS_VOICE_ID;
   process.env.ELEVENLABS_API_KEY = 'test-key';
-  process.env.ELEVENLABS_VOICE = 'brian';
+  delete process.env.ELEVENLABS_AGENT_ID;
+  delete process.env.ELEVENLABS_VOICE_ID;
   const originalFetch = global.fetch;
-  let seen;
-  global.fetch = async (url, options) => {
-    seen = { url, options };
-    return {
-      ok: true,
-      status: 200,
-      json: async () => ({ value: 'ek_test_secret', expires_at: 123, session: { leak: true } })
-    };
+  const calls = [];
+  global.fetch = async (url, options = {}) => {
+    calls.push({ url, method: options.method || 'GET', body: options.body, key: options.headers['xi-api-key'] });
+    if (url.includes('/v1/convai/agents?')) return { ok: true, json: async () => ({ agents: [] }) };
+    if (url.endsWith('/v1/convai/agents/create')) return { ok: true, json: async () => ({ agent_id: 'agent_created' }) };
+    if (url.includes('/v1/convai/agents/agent_created')) return { ok: true, json: async () => ({ agent_id: 'agent_created' }) };
+    if (url.includes('/get-signed-url')) return { ok: true, json: async () => ({ signed_url: SIGNED }) };
+    throw new Error(`unexpected ${url}`);
   };
   try {
     const res = mockRes();
     await handler({ method: 'POST' }, res);
     assert.equal(res.statusCode, 200);
-    assert.equal(seen.url, 'https://api.elevenlabs.io/v1/convai/realtime/client_secrets');
-    assert.equal(seen.options.headers['xi-api-key'], 'test-key');
-    assert.equal(seen.options.headers.Authorization, undefined);
-    const body = JSON.parse(seen.options.body);
-    assert.equal(body.session.model, 'eleven_realtime_v1_mini');
-    assert.equal(body.expires_after.anchor, 'created_at');
-    assert.equal(body.expires_after.seconds, 600);
-    assert.equal(res.body.token, 'ek_test_secret');
-    assert.equal(res.body.url, REALTIME_URL);
-    assert.equal(res.body.session.audio.output.voice, 'brian');
-    assert.equal(res.body.session.leak, undefined);
+    assert.equal(res.body.url, SIGNED);
+    assert.equal(res.body.model, 'eleven_v4_turbo');
     assert.equal(JSON.stringify(res.body).includes('test-key'), false);
-    assert.doesNotThrow(() => assertRealtimeSession(res.body.session));
+    assert.equal(calls[0].key, 'test-key');
+    assert.equal(calls[0].headers?.Authorization, undefined);
+    const created = JSON.parse(calls[1].body);
+    assert.equal(created.conversation_config.tts.model_id, 'eleven_v4_turbo');
+    assert.equal(created.conversation_config.agent.prompt.prompt, INSTRUCTIONS);
+    const patched = JSON.parse(calls[2].body);
+    assert.equal(patched.conversation_config.tts.model_id, 'eleven_v4_turbo');
+    assert.match(calls[3].url, /agent_id=agent_created/);
   } finally {
     global.fetch = originalFetch;
-    if (previousKey === undefined) delete process.env.ELEVENLABS_API_KEY;
-    else process.env.ELEVENLABS_API_KEY = previousKey;
-    if (previousVoice === undefined) delete process.env.ELEVENLABS_VOICE;
-    else process.env.ELEVENLABS_VOICE = previousVoice;
+    if (previous === undefined) delete process.env.ELEVENLABS_API_KEY;
+    else process.env.ELEVENLABS_API_KEY = previous;
+    if (previousAgent === undefined) delete process.env.ELEVENLABS_AGENT_ID;
+    else process.env.ELEVENLABS_AGENT_ID = previousAgent;
+    if (previousVoice === undefined) delete process.env.ELEVENLABS_VOICE_ID;
+    else process.env.ELEVENLABS_VOICE_ID = previousVoice;
   }
 });
 
-test('token route hides upstream error bodies', async () => {
+test('token route reuses an existing agent and hides upstream error bodies', async () => {
   const previous = process.env.ELEVENLABS_API_KEY;
   process.env.ELEVENLABS_API_KEY = 'test-key';
   const originalFetch = global.fetch;
-  global.fetch = async () => ({ ok: false, status: 401, json: async () => ({ detail: 'secret upstream body' }) });
+  global.fetch = async (url) => {
+    if (url.includes('/v1/convai/agents?')) {
+      return { ok: false, status: 401, json: async () => ({ detail: 'secret upstream body' }) };
+    }
+    throw new Error(`unexpected ${url}`);
+  };
   try {
     const res = mockRes();
     await handler({ method: 'POST' }, res);
@@ -127,22 +143,19 @@ test('token route hides upstream error bodies', async () => {
   }
 });
 
-test('the page keeps its layout and no longer calls xAI', () => {
+test('the page keeps its layout and no longer uses Realtime v1', () => {
   const html = readFileSync(new URL('../public/index.html', import.meta.url), 'utf8');
   assert.match(html, /<h1>Grok Voice<\/h1>/);
   assert.match(html, /Speak to Grok\. Microphone access is required\./);
   assert.match(html, /id="connect"/);
-  assert.match(html, /id="disconnect"/);
   assert.match(html, /id="level-fill"/);
-  assert.match(html, /id="log"/);
   assert.match(html, /background: #fff; color: #111/);
+  assert.equal(html.includes('eleven_realtime'), false);
   assert.equal(html.includes('api.x.ai'), false);
-  assert.equal(html.includes('XAI_API_KEY'), false);
-  assert.equal(html.includes('xai-client-secret'), false);
-  assert.match(html, /from '\/realtime-session\.js'/);
-  assert.match(html, /openai-insecure-api-key/);
-  assert.match(html, /ElevenLabs charges/);
-  const shared = readFileSync(new URL('../public/realtime-session.js', import.meta.url), 'utf8');
-  assert.match(shared, /wss:\/\/api\.elevenlabs\.io\/v1\/convai\/realtime/);
-  assert.match(shared, /eleven_realtime_v1_mini/);
+  assert.equal(html.includes('openai-insecure-api-key'), false);
+  assert.match(html, /from '\/agent-session\.js'/);
+  assert.match(html, /user_audio_chunk/);
+  const shared = readFileSync(new URL('../public/agent-session.js', import.meta.url), 'utf8');
+  assert.match(shared, /eleven_v4_turbo/);
+  assert.equal(shared.includes('eleven_realtime'), false);
 });

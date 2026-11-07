@@ -46,8 +46,7 @@ small { display: block; font-size: 14px; margin-top: 16px; }
 <noscript><p>JavaScript is required for voice chat.</p></noscript>
 </main>
 <script type="module">
-import { REALTIME_URL, assertRealtimeSession } from '/realtime-session.js';
-const PROTOCOL_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+import { INPUT_FORMAT, TTS_MODEL, assertSignedUrl, buildInitiation, pcmRate } from '/agent-session.js';
 const $ = id => document.getElementById(id);
 let session = null;
 const setStatus = text => { $('status').textContent = text; };
@@ -88,196 +87,103 @@ function watchdog(s) {
   clearTimeout(s.responseTimer);
   s.responseTimer = setTimeout(() => fail(s, 'No response activity for 60 seconds. Please reconnect.'), 60000);
 }
-// Full duplex: microphone input is independent of response generation/playback.
 function refresh(s) {
   if (session !== s || !s.ready) return;
   $('mic-label').textContent = 'Microphone live';
   setStatus(s.userSpeaking ? (s.didInterrupt ? 'Listening to you — reply interrupted' : 'Listening to you…') :
     s.sources.size ? 'Grok is speaking — you can interrupt' :
-    s.busy || s.waiting ? 'Grok is thinking — microphone live' : 'Listening — speak any time');
+    s.busy ? 'Grok is thinking — microphone live' : 'Listening — speak any time');
 }
-function responseFor(s, event) {
-  const id = event.response_id || event.response?.id || s.currentId;
-  return id ? s.responses.get(id) : null;
-}
-function itemFor(s, response, event) {
-  const key = `${event.item_id || response.id}:${event.content_index ?? 0}`;
-  let item = s.items.get(key);
-  if (!item) {
-    item = { key, id: event.item_id, contentIndex: event.content_index ?? 0,
-      responseId: response.id, chunks: [], receivedSeconds: 0, span: null };
-    s.items.set(key, item); response.items.add(key);
-  }
-  return item;
-}
-function playedSeconds(s, item) {
-  // Use the output-device timestamp when available, rather than generated duration.
-  const stamp = s.audio.getOutputTimestamp?.();
-  const now = stamp?.contextTime > 0 ? stamp.contextTime :
-    Math.max(0, s.audio.currentTime - (s.audio.outputLatency || 0));
-  return item.chunks.reduce((sum, chunk) =>
-    sum + Math.max(0, Math.min(chunk.duration, now - chunk.start)), 0);
-}
-function interrupt(s) {
-  // ElevenLabs semantic VAD cancels server generation when interrupt_response is on.
-  // Do not race it with a redundant response.cancel, and NEVER clear the input buffer here.
-  clearTimeout(s.responseTimer);
-  const affected = new Set();
-  for (const source of s.sources) affected.add(source.responseId);
-  const current = s.responses.get(s.currentId);
-  if (current && !current.done) affected.add(current.id);
-  s.didInterrupt = affected.size > 0;
-  // Even a generation-complete response may have seconds of queued local audio.
-  for (const id of affected) {
-    const response = s.responses.get(id);
-    if (!response || response.ignored) continue;
-    response.ignored = true;
-    for (const key of response.items) {
-      const item = s.items.get(key);
-      const played = Math.min(item.receivedSeconds, playedSeconds(s, item));
-      if (item.id && (!response.done || played < item.receivedSeconds)) {
-        item.truncated = true;
-        const eventId = `truncate_${++s.eventCounter}`;
-        s.truncateRequests.add(eventId);
-        send(s, { event_id: eventId, type: 'conversation.item.truncate',
-          item_id: item.id, content_index: item.contentIndex,
-          audio_end_ms: Math.max(0, Math.floor(played * 1000)) });
-        if (item.span) item.span.textContent = '[Interrupted; unplayed remainder removed.]';
-      }
-        if (item.span) item.span.previousSibling.textContent = 'Grok (interrupted): ';
-    }
-  }
-  // Stop *all* currently playing AND future-scheduled AudioBufferSourceNodes.
+function stopPlayback(s) {
   for (const source of s.sources) {
     source.onended = null;
     try { source.stop(); } catch {}
     source.disconnect();
   }
-  s.sources.clear(); s.nextTime = s.audio.currentTime;
-  s.blockOutput = true; s.busy = false; s.waiting = false;
-  refresh(s);
+  s.sources.clear();
+  s.nextTime = s.audio.currentTime;
 }
-function playPCM(s, response, event) {
-  if (s.blockOutput || response.ignored || s.userSpeaking) return;
-  const bytes = Uint8Array.from(atob(event.delta), c => c.charCodeAt(0));
+function playPcm(s, base64) {
+  if (!s.ready || s.blockOutput || !base64) return;
+  const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
   if (!bytes.length) return;
   if (bytes.length % 2) throw new Error('Received malformed PCM16 audio.');
-  const pcm = new DataView(bytes.buffer), buffer = s.audio.createBuffer(1, bytes.length / 2, 24000);
+  const pcm = new DataView(bytes.buffer), buffer = s.audio.createBuffer(1, bytes.length / 2, s.outputRate);
   const channel = buffer.getChannelData(0);
   for (let i = 0; i < channel.length; i++) channel[i] = pcm.getInt16(i * 2, true) / 32768;
-  const item = itemFor(s, response, event);
-  const source = s.audio.createBufferSource(); source.buffer = buffer;
-  source.responseId = response.id; source.connect(s.audio.destination);
+  const source = s.audio.createBufferSource();
+  source.buffer = buffer; source.connect(s.audio.destination);
   const start = Math.max(s.nextTime, s.audio.currentTime + 0.02);
-  item.chunks.push({ start, duration: buffer.duration });
-  item.receivedSeconds += buffer.duration;
   s.sources.add(source);
   source.onended = () => { source.disconnect(); s.sources.delete(source); refresh(s); };
   source.start(start); s.nextTime = start + buffer.duration; refresh(s);
 }
-function arm(s) {
-  if (session !== s || s.ready) return;
-  s.ready = true; clearTimeout(s.connectTimer);
-  line('You', 'Hello!');
-  send(s, { type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hello!' }] }});
-  s.busy = true; send(s, { type: 'response.create' }); watchdog(s); refresh(s);
-}
 function receive(s, event) {
   if (session !== s) return;
-  const response = responseFor(s, event);
-  // Ignore late events belonging to interrupted turns. They must not restart
-  // playback or reset the state of a newer answer.
-  if (event.type.startsWith('response.') && event.type !== 'response.created' && response?.ignored) {
-    if (event.type === 'response.done') response.done = true;
-    return;
-  }
-  if (s.busy && (!event.response_id || event.response_id === s.currentId)) watchdog(s);
   switch (event.type) {
-    case 'session.created':
-      if (s.configSent) break;
-      s.configSent = true;
-      if (!s.sessionConfig) throw new Error('Missing ElevenLabs session configuration.');
-      try {
-        // The client secret's session is authoritative. Confirm it, and only send
-        // session.update when the socket did not already adopt that 24 kHz config.
-        assertRealtimeSession(event.session);
-        arm(s);
-      } catch {
-        send(s, { type: 'session.update', session: s.sessionConfig });
+    case 'ping': {
+      const ping = event.ping_event || {};
+      const delay = Number.isFinite(ping.ping_ms) && ping.ping_ms >= 0 && ping.ping_ms <= 10000 ? ping.ping_ms : 0;
+      setTimeout(() => {
+        if (session === s && s.ws?.readyState === WebSocket.OPEN) {
+          try { send(s, { type: 'pong', event_id: ping.event_id }); } catch (error) { fail(s, error.message); }
+        }
+      }, delay);
+      break;
+    }
+    case 'conversation_initiation_metadata': {
+      const meta = event.conversation_initiation_metadata_event || {};
+      const inputFormat = meta.user_input_audio_format;
+      if (inputFormat !== INPUT_FORMAT) throw new Error(`This page sends ${INPUT_FORMAT}, but the agent expects ${inputFormat || 'an unknown format'}.`);
+      s.outputRate = pcmRate(meta.agent_output_audio_format);
+      if (!s.ready) { s.ready = true; clearTimeout(s.connectTimer); refresh(s); }
+      break;
+    }
+    case 'user_transcript':
+      line('You', event.user_transcription_event?.user_transcript || '[Voice message]');
+      s.userSpeaking = false; s.waiting = true; s.busy = true; watchdog(s); refresh(s);
+      break;
+    case 'agent_response': {
+      const response = event.agent_response_event || {};
+      const id = response.response_id || response.event_id;
+      let span = id == null ? null : s.lines.get(id);
+      if (!span) {
+        span = line('Grok', response.agent_response || '');
+        if (id != null) s.lines.set(id, span);
+      } else span.textContent = response.agent_response || '';
+      s.currentSpan = span; s.blockOutput = false; s.userSpeaking = false; s.busy = true; watchdog(s); refresh(s);
+      break;
+    }
+    case 'agent_response_correction': {
+      const correction = event.agent_response_correction_event;
+      if (s.currentSpan && correction?.corrected_agent_response) s.currentSpan.textContent = correction.corrected_agent_response;
+      break;
+    }
+    case 'audio':
+      s.busy = true; watchdog(s);
+      playPcm(s, event.audio_event?.audio_base_64);
+      if (event.audio_event?.is_final) { s.busy = false; clearTimeout(s.responseTimer); refresh(s); }
+      break;
+    case 'interruption':
+      s.userSpeaking = true; s.didInterrupt = s.sources.size > 0 || s.busy; s.blockOutput = true; s.busy = false;
+      if (s.currentSpan && s.didInterrupt) s.currentSpan.previousSibling.textContent = 'Grok (interrupted): ';
+      stopPlayback(s); clearTimeout(s.responseTimer); refresh(s);
+      break;
+    case 'agent_response_complete':
+      s.busy = false; clearTimeout(s.responseTimer); refresh(s);
+      break;
+    case 'client_tool_call': {
+      const call = event.client_tool_call || {};
+      if (call.expects_response && call.tool_call_id) {
+        send(s, { type: 'client_tool_result', tool_call_id: call.tool_call_id, result: 'This voice page does not run tools.', is_error: true });
       }
-      break;
-    case 'session.updated':
-      if (!s.configSent || s.ready) break;
-      assertRealtimeSession(event.session || s.sessionConfig);
-      arm(s);
-      break;
-    case 'input_audio_buffer.speech_started':
-      s.userSpeaking = true;
-      interrupt(s);
-      break;
-    case 'input_audio_buffer.speech_stopped':
-      s.userSpeaking = false; s.waiting = true; watchdog(s); refresh(s);
-      break;
-    case 'input_audio_buffer.committed':
-      s.waiting = true; watchdog(s); refresh(s);
-      // VAD will create the next response. No manual commit or response.create.
-      break;
-    case 'response.created': {
-      const id = event.response?.id || event.response_id;
-      if (!id) throw new Error('ElevenLabs response.created omitted its response ID.');
-      if (s.responses.has(id)) break;
-      const next = { id, done: false, ignored: s.userSpeaking, items: new Set() };
-      s.responses.set(id, next);
-      if (next.ignored) break; // A superseded response already in flight.
-      s.currentId = id; s.busy = true; s.waiting = false; s.blockOutput = false;
-      watchdog(s); refresh(s);
+      showError(`This agent requested the tool “${call.tool_name || 'unknown'}”. Remove client tools from this conversational agent.`);
       break;
     }
-    case 'conversation.item.input_audio_transcription.completed':
-      line('You', event.transcript || '[Voice message]');
+    case 'client_error':
+      throw new Error(event.error_event?.message || event.error_event?.error_name || 'ElevenLabs reported an error.');
+    default:
       break;
-    case 'conversation.item.truncated': {
-      const item = s.items.get(`${event.item_id}:${event.content_index ?? 0}`);
-      if (item?.truncated && item.span && typeof event.transcript === 'string') {
-        item.span.textContent = event.transcript || '[Interrupted before audible speech.]';
-      }
-      break;
-    }
-    case 'response.output_audio_transcript.delta':
-    case 'response.audio_transcript.delta': {
-      if (!response || s.blockOutput || s.userSpeaking) break;
-      const item = itemFor(s, response, event);
-      item.span ||= line('Grok'); item.span.textContent += event.delta || '';
-      $('log').scrollTop = $('log').scrollHeight;
-      break;
-    }
-    case 'response.output_audio_transcript.done':
-    case 'response.audio_transcript.done': {
-      if (!response || s.blockOutput || s.userSpeaking || typeof event.transcript !== 'string') break;
-      const item = itemFor(s, response, event);
-      item.span ||= line('Grok'); item.span.textContent = event.transcript;
-      break;
-    }
-    case 'response.output_audio.delta':
-    case 'response.audio.delta': if (response) playPCM(s, response, event); break;
-    case 'response.function_call_arguments.done':
-      throw new Error(`This agent requested the custom tool “${event.name || 'unknown'}”. Implement its authorized backend handler before using this tool-enabled agent.`);
-    case 'response.done':
-      if (response) response.done = true;
-      if (response && response.id !== s.currentId) break;
-      clearTimeout(s.responseTimer); s.busy = false;
-      if (event.response?.status === 'failed') throw new Error(event.response.status_details?.error?.message || 'ElevenLabs could not complete the response.');
-      if (event.response?.status === 'incomplete') showError('ElevenLabs returned an incomplete response. You can speak again.');
-      refresh(s); break;
-    case 'error':
-      // Context truncation can race a server-side cancel. Keep the voice session
-      // usable, but surface any failure to trim history rather than hiding it.
-      if (s.truncateRequests.has(event.error?.event_id)) {
-        s.truncateRequests.delete(event.error.event_id);
-        showError('Reply stopped, but ElevenLabs could not trim the interrupted conversation history. ' + (event.error?.message || ''));
-        break;
-      }
-      throw new Error(event.error?.message || 'ElevenLabs reported an error.');
   }
 }
 $('connect').onclick = async () => {
@@ -291,15 +197,13 @@ $('connect').onclick = async () => {
   let s;
   try {
     const audio = new AudioContextClass();
-    s = { audio, sources: new Set(), abort: new AbortController(), nextTime: 0, ready: false, busy: false, userSpeaking: false, waiting: false, blockOutput: false, responses: new Map(), items: new Map(), truncateRequests: new Set(), eventCounter: 0 };
+    s = { audio, sources: new Set(), lines: new Map(), abort: new AbortController(), nextTime: 0, outputRate: 16000, ready: false, busy: false, userSpeaking: false, didInterrupt: false, blockOutput: false };
     session = s; $('connect').disabled = true; $('disconnect').disabled = false;
     setStatus('Allow microphone access to continue…');
-    // Resume from the user's click, before other asynchronous work.
     await audio.resume();
     if (session !== s) return;
     if (!audio.audioWorklet) throw new Error('AudioWorklet is required for microphone streaming. Try a modern browser over HTTPS.');
     if (!Number.isFinite(audio.sampleRate) || audio.sampleRate <= 0) throw new Error(`Unsupported audio sample rate: ${audio.sampleRate}. Try another audio device.`);
-    // Mandatory: no token is requested and no socket opened until this succeeds.
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     if (session !== s) { stream.getTracks().forEach(track => track.stop()); return; }
     s.stream = stream;
@@ -320,17 +224,16 @@ $('connect').onclick = async () => {
       if (session !== s) return;
       s.lastMicFrame = Date.now(); s.resolveMic?.(); s.resolveMic = s.rejectMic = null;
       $('level-fill').style.width = `${Math.min(100, data.level * 500)}%`;
-      // NEVER gate input on playback or busy state: speech must reach VAD during replies.
       if (!s.ready || s.ws?.readyState !== WebSocket.OPEN) return;
       try {
         if (s.ws.bufferedAmount > 1024 * 1024) throw new Error('Network too slow for microphone streaming. Reconnect on a faster connection.');
         const bytes = new Uint8Array(data.bytes);
         let binary = ''; for (const byte of bytes) binary += String.fromCharCode(byte);
-        send(s, { type: 'input_audio_buffer.append', audio: btoa(binary) });
+        send(s, { user_audio_chunk: btoa(binary) });
       } catch (error) { fail(s, error.message); }
     };
     s.input.connect(s.worklet); s.worklet.connect(audio.destination);
-    await micReady; // Require actual audio frames, even if they contain silence.
+    await micReady;
     if (session !== s) return;
     $('mic-label').textContent = 'Microphone ready'; setStatus('Connecting to Grok…');
     s.healthTimer = setInterval(() => {
@@ -341,23 +244,16 @@ $('connect').onclick = async () => {
     try { data = await response.json(); } catch { throw new Error('/api/token did not return JSON. Deploy the complete project, not just index.html.'); }
     if (!response.ok) throw new Error(data.error || `Token request failed (${response.status}).`);
     if (session !== s) return;
-    if (typeof data.token !== 'string' || !data.token) throw new Error('Missing ephemeral token.');
-    if (!PROTOCOL_TOKEN.test(data.token)) throw new Error('ElevenLabs returned a client secret this browser cannot send on a WebSocket.');
-    const endpoint = new URL(data.url);
-    if (endpoint.href !== REALTIME_URL) throw new Error('Unexpected WebSocket endpoint.');
-    assertRealtimeSession(data.session);
-    s.sessionConfig = data.session;
-    // Browsers cannot set Authorization on a WebSocket. ElevenLabs accepts the OpenAI
-    // Realtime subprotocols, with the minted client secret in place of an OpenAI key.
-    s.ws = new WebSocket(endpoint.href, ['realtime', `openai-insecure-api-key.${data.token}`]);
-    s.ws.onopen = () => setStatus('Connected — configuring voice…');
-    s.ws.onmessage = ({ data }) => { try { receive(s, JSON.parse(data)); } catch (error) { fail(s, error.message); } };
-    s.ws.onerror = () => fail(s, 'WebSocket failed. Check ElevenLabs Realtime access and your network. Browser APIs do not expose the handshake error body.');
-    s.ws.onclose = event => {
-      const hint = event.code === 4001 ? ' The client secret was rejected or expired.'
-        : event.code === 4003 ? ' Realtime is not enabled for this ElevenLabs workspace.' : '';
-      fail(s, `ElevenLabs closed the connection (code ${event.code}${event.reason ? `: ${event.reason}` : ''}).${hint} Start a new voice chat.`);
+    if (data.model !== TTS_MODEL) throw new Error('Unexpected ElevenLabs voice model.');
+    assertSignedUrl(data.url);
+    s.ws = new WebSocket(data.url);
+    s.ws.onopen = () => {
+      setStatus('Connected — configuring voice…');
+      try { send(s, buildInitiation()); } catch (error) { fail(s, error.message); }
     };
+    s.ws.onmessage = ({ data }) => { try { receive(s, JSON.parse(data)); } catch (error) { fail(s, error.message); } };
+    s.ws.onerror = () => fail(s, 'WebSocket failed. Check ElevenLabs conversational agent access and your network. Browser APIs do not expose the handshake error body.');
+    s.ws.onclose = event => fail(s, `ElevenLabs closed the connection (code ${event.code}${event.reason ? `: ${event.reason}` : ''}). Start a new voice chat.`);
   } catch (error) {
     const messages = {
       NotAllowedError: 'Microphone permission is required. Allow microphone access in your browser/site settings, then try again.',

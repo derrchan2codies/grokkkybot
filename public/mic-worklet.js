@@ -4,7 +4,7 @@ import { createDownsampler } from './pcm-resample.js';
 class PCMCapture extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.downsampler = createDownsampler(sampleRate, 24000);
+    this.downsampler = createDownsampler(sampleRate, 16000, 320);
   }
   process(inputs, outputs) {
     for (const channel of outputs[0] || []) channel.fill(0);
