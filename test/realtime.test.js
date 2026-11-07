@@ -13,7 +13,8 @@ import {
 } from '../public/agent-session.js';
 import { createDownsampler } from '../public/pcm-resample.js';
 
-const SIGNED = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&token=ct_test_secret`;
+const SIGNED = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&conversation_signature=ct_test_secret`;
+const SIGNED_LEGACY_TOKEN = `wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}&token=ct_test_secret`;
 
 function mockRes() {
   return {
@@ -38,8 +39,10 @@ test('conversation targets the required Eleven v4 Turbo agent', () => {
   );
   assert.throws(() => buildInitiation('missing'), /agent ID is required/);
   assert.equal(assertSignedUrl(SIGNED), SIGNED);
+  assert.equal(assertSignedUrl(SIGNED_LEGACY_TOKEN), SIGNED_LEGACY_TOKEN);
   assert.throws(() => assertSignedUrl('wss://api.elevenlabs.io/v1/convai/realtime?agent_id=' + AGENT_ID), /signed URL/i);
-  assert.throws(() => assertSignedUrl(`wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_someoneelse0001&token=x`), /agent ID/);
+  assert.throws(() => assertSignedUrl(`wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_someoneelse0001&conversation_signature=x`), /agent ID/);
+  assert.throws(() => assertSignedUrl(`wss://api.elevenlabs.io/v1/convai/conversation?agent_id=${AGENT_ID}`), /signature/i);
   assert.deepEqual(parseAudioFormat('pcm_16000'), { encoding: 'pcm', rate: 16000, format: 'pcm_16000' });
   assert.throws(() => parseAudioFormat('ulaw_8000'), /audio format/);
   const metadata = assertConversationMetadata({
@@ -142,7 +145,7 @@ test('token route hides upstream error bodies and rejects a mismatched agent URL
     global.fetch = async () => ({
       ok: true,
       status: 200,
-      json: async () => ({ signed_url: 'wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_someoneelse0001&token=nope' })
+      json: async () => ({ signed_url: 'wss://api.elevenlabs.io/v1/convai/conversation?agent_id=agent_someoneelse0001&conversation_signature=nope' })
     });
     const mismatched = mockRes();
     await handler({ method: 'POST' }, mismatched);

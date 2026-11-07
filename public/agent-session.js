@@ -76,9 +76,10 @@ export function assertSignedUrl(signedUrl, agentId = AGENT_ID) {
   if (url.searchParams.get('agent_id') !== requiredAgentId) {
     throw new Error('Signed URL is missing the required conversational agent ID.');
   }
-  const token = url.searchParams.get('token');
-  if (typeof token !== 'string' || !token.trim()) {
-    throw new Error('Signed URL is missing its conversation token.');
+  // ElevenLabs currently signs with conversation_signature; keep token as a fallback.
+  const signature = url.searchParams.get('conversation_signature') || url.searchParams.get('token');
+  if (typeof signature !== 'string' || !signature.trim()) {
+    throw new Error('Signed URL is missing its conversation signature.');
   }
   return signedUrl;
 }
