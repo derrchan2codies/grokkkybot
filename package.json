@@ -1,6 +1,6 @@
 {
-  "name": "elevenlabs-realtime-vercel",
-  "version": "1.1.0",
+  "name": "elevenlabs-convai-vercel",
+  "version": "2.0.0",
   "private": true,
   "type": "module",
   "engines": {

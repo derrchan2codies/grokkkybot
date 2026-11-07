@@ -1,5 +1,5 @@
-// Stream Float32 mono audio down to 24 kHz PCM16. ElevenLabs Realtime documents only this rate.
-export function createDownsampler(inputRate, outputRate = 24000, chunkSize = 480) {
+// Stream Float32 mono audio to PCM16. Conversational agents default to 16 kHz.
+export function createDownsampler(inputRate, outputRate = 16000, chunkSize = 480) {
   if (!Number.isFinite(inputRate) || inputRate <= 0) throw new Error('Invalid microphone sample rate.');
   if (!Number.isFinite(outputRate) || outputRate <= 0) throw new Error('Invalid output sample rate.');
   const ratio = inputRate / outputRate;
