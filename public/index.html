@@ -42,10 +42,12 @@ small { display: block; font-size: 14px; margin-top: 16px; }
 <section id="log" role="log" aria-label="Conversation" aria-live="polite" aria-relevant="additions text"><p id="empty">Allow your microphone, then talk naturally. You can interrupt any reply.</p></section>
 <small>Speak at any time—even while Grok is replying. Detected speech stops the reply so you can ask your next question.</small>
 <small>Headphones give the most reliable interruptions. Browser echo cancellation reduces speaker feedback but cannot eliminate it on every device.</small>
-<small>Disconnect when finished. Connected sessions may incur xAI charges.</small>
+<small>Disconnect when finished. Connected sessions may incur ElevenLabs charges.</small>
 <noscript><p>JavaScript is required for voice chat.</p></noscript>
 </main>
 <script type="module">
+import { REALTIME_URL, assertRealtimeSession } from '/realtime-session.js';
+const PROTOCOL_TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
 const $ = id => document.getElementById(id);
 let session = null;
 const setStatus = text => { $('status').textContent = text; };
@@ -117,8 +119,8 @@ function playedSeconds(s, item) {
     sum + Math.max(0, Math.min(chunk.duration, now - chunk.start)), 0);
 }
 function interrupt(s) {
-  // xAI server_vad cancels server generation automatically. Do not race it with
-  // a redundant response.cancel, and NEVER clear the user's input buffer here.
+  // ElevenLabs semantic VAD cancels server generation when interrupt_response is on.
+  // Do not race it with a redundant response.cancel, and NEVER clear the input buffer here.
   clearTimeout(s.responseTimer);
   const affected = new Set();
   for (const source of s.sources) affected.add(source.responseId);
@@ -142,7 +144,7 @@ function interrupt(s) {
           audio_end_ms: Math.max(0, Math.floor(played * 1000)) });
         if (item.span) item.span.textContent = '[Interrupted; unplayed remainder removed.]';
       }
-      if (item.span) item.span.previousSibling.textContent = 'Grok (interrupted): ';
+        if (item.span) item.span.previousSibling.textContent = 'Grok (interrupted): ';
     }
   }
   // Stop *all* currently playing AND future-scheduled AudioBufferSourceNodes.
@@ -173,6 +175,13 @@ function playPCM(s, response, event) {
   source.onended = () => { source.disconnect(); s.sources.delete(source); refresh(s); };
   source.start(start); s.nextTime = start + buffer.duration; refresh(s);
 }
+function arm(s) {
+  if (session !== s || s.ready) return;
+  s.ready = true; clearTimeout(s.connectTimer);
+  line('You', 'Hello!');
+  send(s, { type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hello!' }] }});
+  s.busy = true; send(s, { type: 'response.create' }); watchdog(s); refresh(s);
+}
 function receive(s, event) {
   if (session !== s) return;
   const response = responseFor(s, event);
@@ -187,22 +196,20 @@ function receive(s, event) {
     case 'session.created':
       if (s.configSent) break;
       s.configSent = true;
-      send(s, { type: 'session.update', session: {
-        // Disable idle check-ins so silence does not itself trigger more talking.
-        turn_detection: { type: 'server_vad', idle_timeout_ms: null },
-        audio: {
-          input: { format: { type: 'audio/pcm', rate: s.audio.sampleRate }, transport: 'json' },
-          output: { format: { type: 'audio/pcm', rate: 24000 }, transport: 'json' }
-        }
-      }});
+      if (!s.sessionConfig) throw new Error('Missing ElevenLabs session configuration.');
+      try {
+        // The client secret's session is authoritative. Confirm it, and only send
+        // session.update when the socket did not already adopt that 24 kHz config.
+        assertRealtimeSession(event.session);
+        arm(s);
+      } catch {
+        send(s, { type: 'session.update', session: s.sessionConfig });
+      }
       break;
     case 'session.updated':
-      if (!s.ready) {
-        s.ready = true; clearTimeout(s.connectTimer);
-        line('You', 'Hello!');
-        send(s, { type: 'conversation.item.create', item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'Hello!' }] }});
-        s.busy = true; send(s, { type: 'response.create' }); watchdog(s); refresh(s);
-      }
+      if (!s.configSent || s.ready) break;
+      assertRealtimeSession(event.session || s.sessionConfig);
+      arm(s);
       break;
     case 'input_audio_buffer.speech_started':
       s.userSpeaking = true;
@@ -217,7 +224,7 @@ function receive(s, event) {
       break;
     case 'response.created': {
       const id = event.response?.id || event.response_id;
-      if (!id) throw new Error('xAI response.created omitted its response ID.');
+      if (!id) throw new Error('ElevenLabs response.created omitted its response ID.');
       if (s.responses.has(id)) break;
       const next = { id, done: false, ignored: s.userSpeaking, items: new Set() };
       s.responses.set(id, next);
@@ -259,18 +266,18 @@ function receive(s, event) {
       if (response) response.done = true;
       if (response && response.id !== s.currentId) break;
       clearTimeout(s.responseTimer); s.busy = false;
-      if (event.response?.status === 'failed') throw new Error(event.response.status_details?.error?.message || 'xAI could not complete the response.');
-      if (event.response?.status === 'incomplete') showError('xAI returned an incomplete response. You can speak again.');
+      if (event.response?.status === 'failed') throw new Error(event.response.status_details?.error?.message || 'ElevenLabs could not complete the response.');
+      if (event.response?.status === 'incomplete') showError('ElevenLabs returned an incomplete response. You can speak again.');
       refresh(s); break;
     case 'error':
       // Context truncation can race a server-side cancel. Keep the voice session
       // usable, but surface any failure to trim history rather than hiding it.
       if (s.truncateRequests.has(event.error?.event_id)) {
         s.truncateRequests.delete(event.error.event_id);
-        showError('Reply stopped, but xAI could not trim the interrupted conversation history. ' + (event.error?.message || ''));
+        showError('Reply stopped, but ElevenLabs could not trim the interrupted conversation history. ' + (event.error?.message || ''));
         break;
       }
-      throw new Error(event.error?.message || 'xAI reported an error.');
+      throw new Error(event.error?.message || 'ElevenLabs reported an error.');
   }
 }
 $('connect').onclick = async () => {
@@ -291,7 +298,7 @@ $('connect').onclick = async () => {
     await audio.resume();
     if (session !== s) return;
     if (!audio.audioWorklet) throw new Error('AudioWorklet is required for microphone streaming. Try a modern browser over HTTPS.');
-    if (![8000,16000,22050,24000,32000,44100,48000].includes(audio.sampleRate)) throw new Error(`Unsupported audio sample rate: ${audio.sampleRate}. Try another audio device.`);
+    if (!Number.isFinite(audio.sampleRate) || audio.sampleRate <= 0) throw new Error(`Unsupported audio sample rate: ${audio.sampleRate}. Try another audio device.`);
     // Mandatory: no token is requested and no socket opened until this succeeds.
     const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
     if (session !== s) { stream.getTracks().forEach(track => track.stop()); return; }
@@ -301,7 +308,7 @@ $('connect').onclick = async () => {
     if (track.getSettings().echoCancellation === false) showError('Echo cancellation is not active on this device. Use headphones to prevent Grok’s audio from being detected as your speech.');
     track.onended = () => fail(s, 'Microphone disconnected or permission was revoked. Reconnect your microphone and start again.');
     setStatus('Checking microphone capture…');
-    s.connectTimer = setTimeout(() => fail(s, 'Connection timed out. Check microphone, xAI access, agent ID and network.'), 25000);
+    s.connectTimer = setTimeout(() => fail(s, 'Connection timed out. Check microphone, ElevenLabs access, and network.'), 25000);
     await audio.audioWorklet.addModule('/mic-worklet.js');
     if (session !== s) return;
     s.input = audio.createMediaStreamSource(stream);
@@ -334,14 +341,23 @@ $('connect').onclick = async () => {
     try { data = await response.json(); } catch { throw new Error('/api/token did not return JSON. Deploy the complete project, not just index.html.'); }
     if (!response.ok) throw new Error(data.error || `Token request failed (${response.status}).`);
     if (session !== s) return;
-    if (typeof data.token !== 'string') throw new Error('Missing ephemeral token.');
+    if (typeof data.token !== 'string' || !data.token) throw new Error('Missing ephemeral token.');
+    if (!PROTOCOL_TOKEN.test(data.token)) throw new Error('ElevenLabs returned a client secret this browser cannot send on a WebSocket.');
     const endpoint = new URL(data.url);
-    if (endpoint.protocol !== 'wss:' || endpoint.hostname !== 'api.x.ai' || endpoint.pathname !== '/v1/realtime') throw new Error('Unexpected WebSocket endpoint.');
-    s.ws = new WebSocket(endpoint.href, [`xai-client-secret.${data.token}`]);
+    if (endpoint.href !== REALTIME_URL) throw new Error('Unexpected WebSocket endpoint.');
+    assertRealtimeSession(data.session);
+    s.sessionConfig = data.session;
+    // Browsers cannot set Authorization on a WebSocket. ElevenLabs accepts the OpenAI
+    // Realtime subprotocols, with the minted client secret in place of an OpenAI key.
+    s.ws = new WebSocket(endpoint.href, ['realtime', `openai-insecure-api-key.${data.token}`]);
     s.ws.onopen = () => setStatus('Connected — configuring voice…');
     s.ws.onmessage = ({ data }) => { try { receive(s, JSON.parse(data)); } catch (error) { fail(s, error.message); } };
-    s.ws.onerror = () => fail(s, 'WebSocket failed. Check xAI access, the saved agent ID and your network. Browser APIs do not expose the handshake error body.');
-    s.ws.onclose = event => fail(s, `xAI closed the connection (code ${event.code}${event.reason ? `: ${event.reason}` : ''}). Start a new voice chat.`);
+    s.ws.onerror = () => fail(s, 'WebSocket failed. Check ElevenLabs Realtime access and your network. Browser APIs do not expose the handshake error body.');
+    s.ws.onclose = event => {
+      const hint = event.code === 4001 ? ' The client secret was rejected or expired.'
+        : event.code === 4003 ? ' Realtime is not enabled for this ElevenLabs workspace.' : '';
+      fail(s, `ElevenLabs closed the connection (code ${event.code}${event.reason ? `: ${event.reason}` : ''}).${hint} Start a new voice chat.`);
+    };
   } catch (error) {
     const messages = {
       NotAllowedError: 'Microphone permission is required. Allow microphone access in your browser/site settings, then try again.',
