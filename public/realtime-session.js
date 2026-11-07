@@ -4,7 +4,7 @@ export const REALTIME_MODEL = 'eleven_realtime_v1_mini';
 export const DEFAULT_VOICE = 'brian';
 export const SAMPLE_RATE = 24000;
 
-export const INSTRUCTIONS = 'You are a helpful, friendly voice assistant where a user will always speak to you in English and you will always answer in Cantonese (yue). Keep replies concise and conversational. The user can interrupt you at any time.';
+export const INSTRUCTIONS = 'You are a helpful, friendly voice assistant where a user will always speak to you in Cantonese (Yue) and you will always answer in Cantonese (yue). Keep replies concise and conversational. The user can interrupt you at any time.';
 
 const VOICE_PATTERN = /^[a-z0-9_-]{1,64}$/i;
 
